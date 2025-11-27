@@ -4,7 +4,7 @@ on:
   schedule:
     # Runs at 03:30 UTC every day.
     # This is 9:00 AM in your time (IST = UTC + 5:30).
-    - cron: '30 4 * * *'
+    - cron: '00 3 * * *'
   
   workflow_dispatch: 
     # This line adds a "Run workflow" button so you can test it manually.
