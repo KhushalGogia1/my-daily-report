@@ -1,3 +1,6 @@
+from email.mime.base import MIMEBase
+from email import encoders
+
 import redshift_connector
 import pandas as pd
 import sys
