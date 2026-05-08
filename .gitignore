@@ -2,10 +2,13 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+.env
 # C extensions
 *.so
 
+github_token.env
+sync_report_history.csv
+.DS_Store
 # Distribution / packaging
 .Python
 build/

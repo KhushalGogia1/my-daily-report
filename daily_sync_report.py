@@ -1,377 +1,420 @@
-from email.mime.base import MIMEBase
-from email import encoders
+from __future__ import annotations
 
-import redshift_connector
-import pandas as pd
-import sys
-from textwrap import dedent
+import csv
+import datetime as dt
+import html
+import os
 import smtplib
 import ssl
-from email.mime.text import MIMEText
+import sys
+from dataclasses import dataclass
+from email import encoders
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
+from typing import Any
+
 import pandas as pd
-import datetime
-import os  # <-- THIS IS NEW
-
-# --- 1. SCRIPT CONFIGURATION (Passwords removed) ---
-
-# Redshift Credentials
-DB_HOST = 'redshift-cluster-1.cagh582pjtts.ap-south-1.redshift.amazonaws.com'
-DB_NAME = 'dev'
-DB_PORT = 5439
-DB_USER = 'product_analytics'
-DB_PASS = os.environ.get('REDSHIFT_PASS') # <-- THIS IS THE PLACEHOLDER
-
-# Email Credentials
-SENDER_EMAIL = "khushal.gogia@gromo.in"
-APP_PASSWORD = os.environ.get('GMAIL_APP_PASS') # <-- THIS IS THE PLACEHOLDER
-RECEIVER_EMAIL = "khushal.gogia@gromo.in"
-
-# Email Server
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 465
-
-# Report Settings
-# With a value of 1, today and yesterday are OK.
-# Any date before yesterday will be flagged.
-SYNC_THRESHOLD_DAYS = 1
+import redshift_connector
 
 
-# --- 2. REDSHIFT QUERY FUNCTIONS (No changes here) ---
+BASE_DIR = Path(__file__).resolve().parent
+HISTORY_PATH = BASE_DIR / "sync_report_history.csv"
 
-def get_queries_to_run():
+
+def load_local_env(path: Path = BASE_DIR / ".env") -> None:
+    """Load local .env values without overriding already exported variables."""
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+load_local_env()
+
+
+DB_HOST = os.environ.get("REDSHIFT_HOST", "redshift-cluster-1.cagh582pjtts.ap-south-1.redshift.amazonaws.com")
+DB_NAME = os.environ.get("REDSHIFT_DATABASE", "dev")
+DB_PORT = int(os.environ.get("REDSHIFT_PORT", "5439"))
+DB_USER = os.environ.get("REDSHIFT_USER", "product_analytics")
+DB_PASS = os.environ.get("REDSHIFT_PASSWORD") or os.environ.get("REDSHIFT_PASS")
+
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "khushal.gogia@gromo.in")
+APP_PASSWORD = os.environ.get("GMAIL_APP_PASS")
+RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL", "khushal.gogia@gromo.in")
+SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
+
+
+@dataclass(frozen=True)
+class TableConfig:
+    display_name: str
+    schema: str
+    table: str
+    created_column: str = "createdat"
+
+
+TABLES: list[TableConfig] = [
+    TableConfig("customeraddresses", "gromo_warehouse", "customeraddresses"),
+    TableConfig("customerprofessions", "gromo_warehouse", "customerprofessions"),
+    TableConfig("customers", "gromo_warehouse", "customers"),
+    TableConfig("productlogs", "prod", "docdb_gromo_fintech_productlogs"),
+    TableConfig("userdeviceinfos", "gromo_warehouse", "userdeviceinfos"),
+    TableConfig("user_personas", "gromo_warehouse", "user_personas"),
+    TableConfig("zohotickets", "gromo_warehouse", "zohotickets"),
+    TableConfig("miscellaneousappflyerlogdatas", "gromo_warehouse", "miscellaneousappflyerlogdatas"),
+    TableConfig("miscellaneousbranchlogdatas", "gromo_warehouse", "miscellaneousbranchlogdatas"),
+    TableConfig("usercompetitorappslists", "gromo_warehouse", "usercompetitorappslist"),
+    TableConfig("customerprofiles", "gromo_warehouse", "customerprofiles"),
+    TableConfig("userproductqualities", "gromo_warehouse", "userproductqualities"),
+    TableConfig("brelogsv2", "gromo_warehouse", "brelogsv2"),
+    TableConfig("customer-management-system.customerprofiles", "prod", "docdb_customer_management_system_customerprofiles"),
+    TableConfig("leadinfo", "prod", "docdb_gromo_fintech_leadinfo"),
+    TableConfig("leadpayoutinfo", "prod", "docdb_gromo_fintech_leadpayoutinfo"),
+    TableConfig("users", "gromo_warehouse", "gromo_fintech_users"),
+    TableConfig("agencyusers", "gromo_warehouse", "agencyusers"),
+    TableConfig("products", "gromo_warehouse", "products"),
+]
+
+
+def quote_ident(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def created_at_expression(column_name: str) -> str:
+    column = quote_ident(column_name)
+    text_value = f"{column}::varchar"
+    return f"""
+        CASE
+            WHEN {column} IS NULL THEN NULL
+            WHEN {text_value} LIKE '{{%T%Z%}}'
+                THEN REGEXP_REPLACE(
+                    REGEXP_SUBSTR({text_value}, '[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T[^"}}]+'),
+                    'T|Z',
+                    ' '
+                )::timestamp
+            WHEN {text_value} LIKE '{{%'
+                THEN TIMESTAMP '1970-01-01 00:00:00'
+                    + (CAST(NULLIF(REGEXP_SUBSTR({text_value}, '[0-9]+'), '') AS BIGINT) / 1000)
+                    * INTERVAL '1 second'
+            WHEN {text_value} ~ '^[0-9]{{12,}}$'
+                THEN TIMESTAMP '1970-01-01 00:00:00'
+                    + (CAST({text_value} AS BIGINT) / 1000)
+                    * INTERVAL '1 second'
+            ELSE {column}::timestamp
+        END
     """
-    Defines all queries to be combined.
+
+
+def connect_to_redshift():
+    if not DB_PASS:
+        raise RuntimeError("Missing Redshift password. Set REDSHIFT_PASSWORD in .env.")
+    return redshift_connector.connect(
+        host=DB_HOST,
+        database=DB_NAME,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASS,
+    )
+
+
+def check_one_table(cursor: Any, conn: Any, config: TableConfig) -> dict[str, Any]:
+    relation = f"{quote_ident(config.schema)}.{quote_ident(config.table)}"
+    column = quote_ident(config.created_column)
+    created_at = created_at_expression(config.created_column)
+    sql = f"""
+        SELECT
+            COUNT(*) AS row_count,
+            COUNT({column}) AS non_null_created_at_count,
+            MAX({created_at}) AS latest_sync_date
+        FROM {relation}
     """
-    
-    # Robust epoch_query
-    def epoch_query(table_name):
-        query_template = dedent(f"""
-            SELECT max(TIMESTAMP '1970-01-01 00:00:00' + (CAST(NULLIF(REGEXP_SUBSTR(createdat, '[0-9]+'), '') AS BIGINT) / 1000) * INTERVAL '1 second')
-            FROM gromo_warehouse.{table_name}
-        """)
-        return query_template
 
-    queries_to_run = {
-        # --- Tables using epoch/string conversion ---
-        # "mi_four_wheeler_royal_sundaram_kyc_status_apilog": epoch_query("mi_four_wheeler_royal_sundaram_kyc_status_apilog"),
-        # "mi_four_wheeler_united_search_kyc_data_apilog": epoch_query("mi_four_wheeler_united_search_kyc_data_apilog"),
-        # "mi_four_wheeler_digit_kyc_status_apilog": epoch_query('"mi_four_wheeler_digit_kyc_status_apilog"'),
-        # "mi_four_wheeler_icici_kyc_apilogs": epoch_query('"mi_four_wheeler_icici_kyc_apilogs"'),
-        # "mi_four_wheeler_reliance_kyc_apilogs": epoch_query('"mi_four_wheeler_reliance_kyc_apilogs"'),
-        # "mi_four_wheeler_tata_kyc_apilog": epoch_query('"mi_four_wheeler_tata_kyc_apilog"'),
-        "customers": epoch_query('"customers"'),
-        "user_personas": epoch_query('"user_personas"'),
-        "zohotickets": epoch_query('"zohotickets"'),
-        # "posmodels": epoch_query('"posmodels"'),
-        # "userexammodels": epoch_query('"userexammodels"'),
-        # "insuranceleads": epoch_query('"insuranceleads"'),
-        # "educationmodels": epoch_query('"educationmodels"'),
-        # "panmodels": epoch_query('"panmodels"'),
-        # "selfiemodels": epoch_query('"selfiemodels"'),
-        # "mi_four_wheeler_bajaj_kyc_search_apilog": epoch_query('"mi_four_wheeler_bajaj_kyc_search_apilog"'),
-        # "mi_four_wheeler_reliance_quote_apilogs": epoch_query("mi_four_wheeler_reliance_quote_apilogs"),
-        # "mi_four_wheeler_sbi_proposal_apilogs": epoch_query("mi_four_wheeler_sbi_proposal_apilogs"),
-        # "mi_four_wheeler_digit_quote_apilogs": epoch_query("mi_four_wheeler_digit_quote_apilogs"),
-        # "mi_four_wheeler_reliance_proposal_apilogs": epoch_query("mi_four_wheeler_reliance_proposal_apilogs"),
-        # "mi_four_wheeler_icici_quote_apilogs": epoch_query("mi_four_wheeler_icici_quote_apilogs"),
-        # "mi_four_wheeler_icici_proposal_apilogs": epoch_query("mi_four_wheeler_icici_proposal_apilogs"),
-        # "mi_four_wheeler_digit_proposal_apilogs": epoch_query("mi_four_wheeler_digit_proposal_apilogs"),
-        # "mi_four_wheeler_bajaj_proposal_apilogs": epoch_query("mi_four_wheeler_bajaj_proposal_apilogs"),
-        # "mi_four_wheeler_sbi_quote_apilogs": epoch_query("mi_four_wheeler_sbi_quote_apilogs"),
-        # "mi_four_wheeler_bajaj_quote_apilogs": epoch_query('"mi_four_wheeler_bajaj_quote_apilogs"'),
-        # "mi_four_wheeler_tata_proposal_apilogs": epoch_query("mi_four_wheeler_tata_proposal_apilogs"),
-        # "mi_four_wheeler_tata_quote_apilogs": epoch_query("mi_four_wheeler_tata_quote_apilogs"),
-        # "mi_four_wheeler_united_quote_apilogs": epoch_query("mi_four_wheeler_united_quote_apilogs"),
-        # "mi_four_wheeler_united_proposal_apilogs": epoch_query("mi_four_wheeler_united_proposal_apilogs"),
-        # "mi_four_wheeler_hdfc_quote_apilogs": epoch_query("mi_four_wheeler_hdfc_quote_apilogs"),
-        # "mi_four_wheeler_hdfc_proposal_apilogs": epoch_query("mi_four_wheeler_hdfc_proposal_apilogs"),
-        # "mi_four_wheeler_royal_sundaram_proposal_apilogs": epoch_query("mi_four_wheeler_royal_sundaram_proposal_apilogs"),
-        # "mi_four_wheeler_royal_sundaram_quote_apilogs": epoch_query("mi_four_wheeler_royal_sundaram_quote_apilogs"),
-        # "mi_four_wheeler_internal_apilogs": epoch_query("mi_four_wheeler_internal_apilogs"),
-        # "mi_two_wheeler_reliance_quote_apilogs": epoch_query("mi_two_wheeler_reliance_quote_apilogs"),
-        # "mi_two_wheeler_sbi_proposal_apilogs": epoch_query("mi_two_wheeler_sbi_proposal_apilogs"),
-        # "mi_two_wheeler_digit_quote_apilogs": epoch_query("mi_two_wheeler_digit_quote_apilogs"),
-        # "mi_two_wheeler_reliance_proposal_apilogs": epoch_query("mi_two_wheeler_reliance_proposal_apilogs"),
-        # "mi_two_wheeler_icici_quote_apilogs": epoch_query("mi_two_wheeler_icici_quote_apilogs"),
-        # "mi_two_wheeler_icici_proposal_apilogs": epoch_query("mi_two_wheeler_icici_proposal_apilogs"),
-        # "mi_two_wheeler_digit_proposal_apilogs": epoch_query("mi_two_wheeler_digit_proposal_apilogs"),
-        # "mi_two_wheeler_bajaj_proposal_apilogs": epoch_query("mi_two_wheeler_bajaj_proposal_apilogs"),
-        # "mi_two_wheeler_sbi_quote_apilogs": epoch_query("mi_two_wheeler_sbi_quote_apilogs"),
-        # "mi_two_wheeler_bajaj_quote_apilogs": epoch_query("mi_two_wheeler_bajaj_quote_apilogs"),
-        # "mi_two_wheeler_tata_proposal_apilogs": epoch_query("mi_two_wheeler_tata_proposal_apilogs"),
-        # "mi_two_wheeler_tata_quote_apilogs": epoch_query("mi_two_wheeler_tata_quote_apilogs"),
-        "miscellaneousbranchlogdatas": epoch_query("miscellaneousbranchlogdatas"),
-        "miscellaneousappflyerlogdatas": epoch_query("miscellaneousappflyerlogdatas"),
-        "usercompetitorappslist": epoch_query("usercompetitorappslist"),
-        "userproductqualities": epoch_query("userproductqualities"),
-
-        # Robust special queries
-        "gromo_fintech_users": """
-            SELECT max(
-              (CASE
-                 WHEN createdat LIKE '{%' THEN json_extract_path_text(createdat, '$date')
-                 ELSE createdat::text
-               END
-              )::timestamp
-            )
-            FROM gromo_warehouse."gromo_fintech_users"
-        """,
-        "overall_gp_lead_info (gp_created_date)": """
-            SELECT max(
-              (CASE
-                 WHEN gp_created_date LIKE '{%' THEN json_extract_path_text(gp_created_date, '$date')
-                 ELSE gp_created_date::text
-               END
-              )::timestamp
-            )
-            FROM gromo_warehouse.overall_gp_lead_info
-        """,
-        "overall_gp_lead_info (leads_created_at)": """
-            SELECT max(
-              (CASE
-                 WHEN leads_created_at LIKE '{%' THEN json_extract_path_text(leads_created_at, '$date')
-                 ELSE leads_created_at::text
-               END
-              )::timestamp
-            )
-            FROM gromo_warehouse.overall_gp_lead_info
-        """
+    result = {
+        "table_name": config.display_name,
+        "physical_table": f"{config.schema}.{config.table}",
+        "created_at_column": config.created_column,
+        "row_count": None,
+        "non_null_created_at_count": None,
+        "latest_sync_date": None,
+        "error": "",
     }
-    return queries_to_run
 
-def build_master_query(queries_dict):
-    """Combines all individual queries into one master UNION ALL query."""
-    query_parts = []
-    for table_alias, sub_query in queries_dict.items():
-        safe_alias = table_alias.replace("'", "''")
-        part = dedent(f"""
-            SELECT '{safe_alias}' as table_name, latest_sync_date
-            FROM (
-                {sub_query}
-            ) as t(latest_sync_date)
-        """)
-        query_parts.append(part)
-    master_sql = " \nUNION ALL\n ".join(query_parts)
-    return master_sql
-
-def run_redshift_query():
-    """
-    Connects to Redshift, runs the master query, and returns a DataFrame.
-    Returns (df, None) on success, or (None, error) on failure.
-    """
-    conn = None
     try:
-        conn = redshift_connector.connect(
-            host=DB_HOST,
-            database=DB_NAME,
-            port=DB_PORT,
-            user=DB_USER,
-            password=DB_PASS  # This now uses the placeholder
+        cursor.execute(sql)
+        row_count, non_null_count, latest_sync_date = cursor.fetchone()
+        result.update(
+            {
+                "row_count": row_count,
+                "non_null_created_at_count": non_null_count,
+                "latest_sync_date": latest_sync_date,
+            }
         )
-        print('✅ Connection successful.')
-        queries_dict = get_queries_to_run()
-        print(f"Checking sync status for {len(queries_dict)} tables...")
-        master_query = build_master_query(queries_dict)
-        
-        print("Setting session timeout to 10 minutes...")
+    except Exception as exc:
+        conn.rollback()
+        result["error"] = str(exc)
+
+    return result
+
+
+def run_redshift_checks() -> tuple[pd.DataFrame | None, Exception | None]:
+    try:
+        conn = connect_to_redshift()
+    except Exception as exc:
+        return None, exc
+
+    try:
         with conn.cursor() as cursor:
             cursor.execute("SET statement_timeout = 600000;")
-        print("Timeout set.")
-        
-        print("Executing master query... This may take a few minutes.")
-        df = pd.read_sql_query(master_query, conn)
-        print("✅ Successfully fetched all sync dates.")
-        return df, None
-
-    except Exception as e:
-        print(f"❌ A Redshift error occurred: {e}", file=sys.stderr)
-        return None, e # Return the error
-    
+            rows = []
+            for config in TABLES:
+                print(f"Checking {config.display_name} ({config.schema}.{config.table})...")
+                rows.append(check_one_table(cursor, conn, config))
+            return pd.DataFrame(rows), None
+    except Exception as exc:
+        return None, exc
     finally:
-        if conn:
-            conn.close()
-            print("Connection closed.")
+        conn.close()
 
 
-# --- 3. REPORTING AND EMAIL FUNCTIONS (No changes here) ---
+def read_history() -> pd.DataFrame:
+    if not HISTORY_PATH.exists():
+        return pd.DataFrame()
+    return pd.read_csv(HISTORY_PATH)
 
-def create_report_content(df, error):
-    """
-    Analyzes the DataFrame or error and generates the email subject,
-    body, and HTML.
-    """
-    
-    # Get today's date
-    # .normalize() sets the time to 00:00:00
-    today = pd.to_datetime('today').normalize()
-    
+
+def append_history(current_df: pd.DataFrame, run_date: dt.date) -> None:
+    fieldnames = [
+        "run_date",
+        "table_name",
+        "physical_table",
+        "created_at_column",
+        "row_count",
+        "non_null_created_at_count",
+        "latest_sync_date",
+        "error",
+    ]
+    file_exists = HISTORY_PATH.exists()
+    with HISTORY_PATH.open("a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        for row in current_df.to_dict("records"):
+            latest = row.get("latest_sync_date")
+            writer.writerow(
+                {
+                    "run_date": run_date.isoformat(),
+                    "table_name": row.get("table_name"),
+                    "physical_table": row.get("physical_table"),
+                    "created_at_column": row.get("created_at_column"),
+                    "row_count": row.get("row_count"),
+                    "non_null_created_at_count": row.get("non_null_created_at_count"),
+                    "latest_sync_date": latest.isoformat() if pd.notna(latest) else "",
+                    "error": row.get("error") or "",
+                }
+            )
+
+
+def status_from_history(history_df: pd.DataFrame, table_name: str, target_date: dt.date) -> str:
+    if history_df.empty:
+        return "Not synced"
+
+    table_history = history_df[history_df["table_name"] == table_name].copy()
+    if table_history.empty:
+        return "Not synced"
+
+    latest_dates = pd.to_datetime(table_history["latest_sync_date"], errors="coerce")
+    if latest_dates.dropna().empty:
+        return "Not synced"
+
+    return "Synced" if latest_dates.max().date() >= target_date else "Not synced"
+
+
+def build_report_dataframe(current_df: pd.DataFrame, run_date: dt.date) -> pd.DataFrame:
+    append_history(current_df, run_date)
+    history_df = read_history()
+    target_dates = [run_date - dt.timedelta(days=2), run_date - dt.timedelta(days=1)]
+
+    rows = []
+    for _, row in current_df.iterrows():
+        report_row = {
+            "Table": row["table_name"],
+            target_dates[0].isoformat(): status_from_history(history_df, row["table_name"], target_dates[0]),
+            target_dates[1].isoformat(): status_from_history(history_df, row["table_name"], target_dates[1]),
+            "Latest createdat": pd.to_datetime(row["latest_sync_date"], errors="coerce"),
+            "Rows": row["row_count"],
+            "Note": "Query error" if row.get("error") else ("Zero rows" if row.get("row_count") == 0 else ""),
+        }
+        rows.append(report_row)
+
+    report_df = pd.DataFrame(rows)
+    yesterday_col = target_dates[1].isoformat()
+    day_before_col = target_dates[0].isoformat()
+    report_df["sort_key"] = report_df[yesterday_col].map({"Not synced": 0, "Synced": 1})
+    report_df = report_df.sort_values(["sort_key", day_before_col, "Table"], ascending=[True, True, True])
+    return report_df.drop(columns=["sort_key"])
+
+
+def pill(status: str) -> str:
+    colors = {
+        "Synced": ("#0f766e", "#d9f5ef"),
+        "Not synced": ("#b42318", "#fde8e7"),
+    }
+    text_color, bg_color = colors.get(status, ("#374151", "#f3f4f6"))
+    return (
+        f'<span style="display:inline-block;min-width:88px;text-align:center;'
+        f'padding:5px 10px;border-radius:999px;font-weight:700;color:{text_color};'
+        f'background:{bg_color};">{html.escape(status)}</span>'
+    )
+
+
+def format_latest(value: Any) -> str:
+    if pd.isna(value):
+        return "-"
+    return pd.to_datetime(value).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def create_report_content(current_df: pd.DataFrame | None, error: Exception | None):
+    run_date = dt.date.today()
+    target_dates = [run_date - dt.timedelta(days=2), run_date - dt.timedelta(days=1)]
+
     if error:
-        # --- FAILURE CASE ---
-        subject = "❌ CRITICAL: Redshift Table Sync Script FAILED"
-        text_body = f"""
-        Hello,
-
-        The automated table sync report script failed to run.
-        It could not connect to Redshift or the query failed.
-
-        Error details:
-        {error}
-        """
+        subject = "CRITICAL: Redshift Table Sync Script FAILED"
+        text_body = f"The automated table sync report failed.\n\nError details:\n{error}"
         html_body = f"""
-        <html><body>
-        <h2>❌ CRITICAL: Redshift Table Sync Script FAILED</h2>
-        <p>The automated table sync report script failed to run.
-        It could not connect to Redshift or the query failed.</p>
-        <h3>Error details:</h3>
-        <pre style="background-color:#f1f1f1; border:1px solid #ddd; padding:10px;">
-        {error}
-        </pre>
+        <html><body style="font-family:Arial,sans-serif;">
+          <h2>Redshift Table Sync Script Failed</h2>
+          <pre style="background:#f8fafc;border:1px solid #e5e7eb;padding:12px;">{html.escape(str(error))}</pre>
         </body></html>
         """
-        return subject, text_body, html_body, None # No DataFrame to attach
+        return subject, text_body, html_body, None
 
-    # --- SUCCESS CASE ---
-    
-    # Define the cutoff date for "Not Synced"
-    cutoff_date = today - pd.Timedelta(days=SYNC_THRESHOLD_DAYS)
-    
-    # Create the report DataFrame
-    report_df = df.copy()
-    
-    # Ensure the date column is a proper datetime object
-    report_df['latest_sync_date'] = pd.to_datetime(report_df['latest_sync_date'])
-
-    # 1. Create the 'Status' column
-    report_df['Status'] = '✅ Synced'
-    report_df.loc[report_df['latest_sync_date'].dt.date < cutoff_date.date(), 'Status'] = '❌ NOT SYNCED'
-
-    # 2. Sort the report to show "NOT SYNCED" tables at the top
-    report_df = report_df.sort_values(by=['Status', 'latest_sync_date'], ascending=[False, True])
-    
-    # 3. Get summary numbers
+    report_df = build_report_dataframe(current_df, run_date)
+    yesterday_col = target_dates[1].isoformat()
+    num_not_synced = int((report_df[yesterday_col] == "Not synced").sum())
     total_tables = len(report_df)
-    not_synced_tables = report_df[report_df['Status'] == '❌ NOT SYNCED']
-    num_not_synced = len(not_synced_tables)
 
-    # 4. Create dynamic Subject and Body
-    if num_not_synced == 0:
-        subject = f"✅ Redshift Sync Report: All {total_tables} Tables OK"
-        text_summary = f"Great news! All {total_tables} tables are synced as of {today.strftime('%Y-%m-%d')}."
+    if num_not_synced:
+        subject = f"Redshift Sync Report: {num_not_synced} Not synced for {yesterday_col}"
     else:
-        subject = f"⚠️ Redshift Sync Report: {num_not_synced} Tables NOT SYNCED"
-        text_summary = f"Warning! {num_not_synced} out of {total_tables} tables are NOT SYNCED."
-    
-    text_body = f"""
-    Hello,
+        subject = f"Redshift Sync Report: All {total_tables} Synced for {yesterday_col}"
 
-    {text_summary}
-    (Sync threshold: Flagging tables not updated since {cutoff_date.strftime('%Y-%m-%d')})
-
-    Please find the full report below.
-    This is an automated report.
-
-    Best regards,
-    Python Bot
-    """
-
-    # 5. Create HTML body with styled table
-    def style_row(row):
-        if row.Status == '❌ NOT SYNCED':
-            return ['background-color: #ffe6e6'] * len(row) # Light red
-        return [''] * len(row)
-
-    # Apply the styling and convert to HTML
-    html_table = (
-        report_df.style
-        .apply(style_row, axis=1)
-        .format({'latest_sync_date': "{:%Y-%m-%d %H:%M:%S}"})
-        .hide(axis="index")
-        .to_html()
+    text_body = (
+        f"Redshift sync report for {target_dates[0].isoformat()} and {target_dates[1].isoformat()}.\n"
+        f"{num_not_synced} of {total_tables} tables are Not synced for {yesterday_col}."
     )
+
+    rows_html = []
+    for _, row in report_df.iterrows():
+        note = html.escape(str(row["Note"] or ""))
+        note_html = f'<span style="color:#b42318;font-weight:600;">{note}</span>' if note else ""
+        rows_html.append(
+            "<tr>"
+            f"<td>{html.escape(str(row['Table']))}</td>"
+            f"<td>{pill(str(row[target_dates[0].isoformat()]))}</td>"
+            f"<td>{pill(str(row[target_dates[1].isoformat()]))}</td>"
+            f"<td>{html.escape(format_latest(row['Latest createdat']))}</td>"
+            f"<td style=\"text-align:right;\">{html.escape('' if pd.isna(row['Rows']) else str(int(row['Rows'])))}</td>"
+            f"<td>{note_html}</td>"
+            "</tr>"
+        )
 
     html_body = f"""
     <html>
-      <head>
-        <style>
-          body {{ font-family: 'Arial', sans-serif; }}
-          table {{ border-collapse: collapse; margin-top: 20px; }}
-          th, td {{ 
-            border: 1px solid #ddd; 
-            padding: 8px; 
-            text-align: left; 
-          }}
-          th {{ background-color: #f2f2f2; }}
-        </style>
-      </head>
-      <body>
-        <h2>Redshift Table Sync Report</h2>
-        <p><b>{text_summary}</b></p>
-        <p>(Sync threshold: Tables with last update before {cutoff_date.strftime('%Y-%m-%d')} are flagged)</p>
-        
-        <h3>Full Report (Not Synced at top)</h3>
-        {html_table}
+      <body style="margin:0;background:#f6f7f9;font-family:Arial,sans-serif;color:#172033;">
+        <div style="max-width:1120px;margin:0 auto;padding:28px 20px;">
+          <div style="background:#ffffff;border:1px solid #e6e8ee;border-radius:8px;overflow:hidden;">
+            <div style="padding:22px 24px;border-bottom:1px solid #e6e8ee;">
+              <h2 style="margin:0 0 8px;font-size:22px;">Redshift Sync Report</h2>
+              <div style="font-size:14px;color:#586174;">
+                {target_dates[0].isoformat()} and {target_dates[1].isoformat()}
+              </div>
+            </div>
+            <div style="padding:18px 24px;display:flex;gap:12px;flex-wrap:wrap;">
+              <div style="padding:10px 14px;border:1px solid #e6e8ee;border-radius:8px;">
+                <div style="font-size:12px;color:#586174;">Tables</div>
+                <div style="font-size:22px;font-weight:800;">{total_tables}</div>
+              </div>
+              <div style="padding:10px 14px;border:1px solid #e6e8ee;border-radius:8px;">
+                <div style="font-size:12px;color:#586174;">Not synced for {yesterday_col}</div>
+                <div style="font-size:22px;font-weight:800;color:#b42318;">{num_not_synced}</div>
+              </div>
+            </div>
+            <table style="width:100%;border-collapse:collapse;font-size:13px;">
+              <thead>
+                <tr style="background:#f8fafc;color:#475467;">
+                  <th style="text-align:left;padding:11px 14px;border-top:1px solid #e6e8ee;">Table</th>
+                  <th style="text-align:left;padding:11px 14px;border-top:1px solid #e6e8ee;">{target_dates[0].isoformat()}</th>
+                  <th style="text-align:left;padding:11px 14px;border-top:1px solid #e6e8ee;">{target_dates[1].isoformat()}</th>
+                  <th style="text-align:left;padding:11px 14px;border-top:1px solid #e6e8ee;">Latest createdat</th>
+                  <th style="text-align:right;padding:11px 14px;border-top:1px solid #e6e8ee;">Rows</th>
+                  <th style="text-align:left;padding:11px 14px;border-top:1px solid #e6e8ee;">Note</th>
+                </tr>
+              </thead>
+              <tbody>
+                {"".join(rows_html)}
+              </tbody>
+            </table>
+          </div>
+        </div>
       </body>
     </html>
     """
-    
+
     return subject, text_body, html_body, report_df
 
 
-def send_email(subject, text_body, html_body, report_df):
-    """
-    Connects to the SMTP server and sends the composed email.
-    """
-    
+def send_email(subject: str, text_body: str, html_body: str, report_df: pd.DataFrame | None) -> None:
+    if not APP_PASSWORD:
+        raise RuntimeError("Missing Gmail app password. Set GMAIL_APP_PASS before sending email.")
+
     message = MIMEMultipart("alternative")
     message["Subject"] = subject
     message["From"] = SENDER_EMAIL
     message["To"] = RECEIVER_EMAIL
-
-    # Attach text and HTML parts
     message.attach(MIMEText(text_body, "plain"))
     message.attach(MIMEText(html_body, "html"))
 
-    # Conditionally attach CSV
     if report_df is not None:
-        try:
-            csv_data = report_df.to_csv(index=False)
-            part3 = MIMEBase("application", "octet-stream")
-            part3.set_payload(csv_data)
-            encoders.encode_base64(part3)
-            part3.add_header(
-                "Content-Disposition",
-                "attachment; filename=table_sync_report.csv",
-            )
-            message.attach(part3)
-            print("CSV attachment added.")
-        except Exception as e:
-            print(f"Warning: Could not create CSV attachment. {e}")
+        csv_data = report_df.to_csv(index=False)
+        attachment = MIMEBase("application", "octet-stream")
+        attachment.set_payload(csv_data)
+        encoders.encode_base64(attachment)
+        attachment.add_header("Content-Disposition", "attachment; filename=table_sync_report.csv")
+        message.attach(attachment)
 
-    # Send the email
-    print(f"Connecting to email server {SMTP_SERVER}...")
-    try:
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
-            server.login(SENDER_EMAIL, APP_PASSWORD) # This now uses the placeholder
-            print("Login successful.")
-            server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, message.as_string())
-            print(f"Email successfully sent to {RECEIVER_EMAIL}!")
-
-    except smtplib.SMTPAuthenticationError:
-        print("Error: Authentication failed. Check your SENDER_EMAIL and APP_PASSWORD.", file=sys.stderr)
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}", file=sys.stderr)
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
+        server.login(SENDER_EMAIL, APP_PASSWORD)
+        server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, message.as_string())
 
 
-# --- 4. MAIN EXECUTION (No changes here) ---
+def main() -> int:
+    dry_run = "--dry-run" in sys.argv
+    current_df, redshift_error = run_redshift_checks()
+    subject, text_body, html_body, report_df = create_report_content(current_df, redshift_error)
+
+    if dry_run:
+        print(subject)
+        if report_df is not None:
+            print(report_df.to_string(index=False))
+        else:
+            print(text_body)
+        return 0 if redshift_error is None else 1
+
+    send_email(subject, text_body, html_body, report_df)
+    print(f"Email successfully sent to {RECEIVER_EMAIL}.")
+    return 0
+
 
 if __name__ == "__main__":
-    # 1. Get the data (or an error)
-    df, redshift_error = run_redshift_query()
-    
-    # 2. Create the email content based on success or failure
-    subject, text_body, html_body, report_df = create_report_content(df, redshift_error)
-    
-    # 3. Send the email
-    send_email(subject, text_body, html_body, report_df)
+    raise SystemExit(main())
