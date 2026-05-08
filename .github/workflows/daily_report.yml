@@ -2,10 +2,10 @@ name: Run Daily Sync Report
 
 on:
   schedule:
-    # Runs at 04:23 UTC every day.
-    # This is 9:53 AM IST, chosen to avoid top-of-hour GitHub Actions queue delays
-    # and land close to the intended 10:00 AM run time.
-    - cron: '23 4 * * *'
+    # Runs at 02:30 UTC every day.
+    # This is 8:00 AM IST, giving GitHub Actions and Redshift enough buffer
+    # to deliver the report closer to the intended 10:00 AM time.
+    - cron: '30 2 * * *'
   
   workflow_dispatch: 
     # This line adds a "Run workflow" button so you can test it manually.
