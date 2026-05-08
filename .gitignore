@@ -7,7 +7,6 @@ __pycache__/
 *.so
 
 github_token.env
-sync_report_history.csv
 .DS_Store
 # Distribution / packaging
 .Python

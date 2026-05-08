@@ -10,6 +10,9 @@ on:
   workflow_dispatch: 
     # This line adds a "Run workflow" button so you can test it manually.
 
+permissions:
+  contents: write
+
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
@@ -36,3 +39,23 @@ jobs:
         
         # This is the command to run your Python file.
         run: python daily_sync_report.py
+
+      - name: Persist sync history
+        run: |
+          if [ ! -f sync_report_history.csv ]; then
+            echo "No sync history file was created."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sync_report_history.csv
+
+          if git diff --cached --quiet; then
+            echo "No sync history changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update sync report history [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main
