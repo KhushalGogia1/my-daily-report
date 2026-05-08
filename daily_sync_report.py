@@ -61,25 +61,31 @@ class TableConfig:
     schema: str
     table: str
     created_column: str = "createdat"
+    sync_strategy: str = "created_at"
 
 
 TABLES: list[TableConfig] = [
-    TableConfig("customeraddresses", "gromo_warehouse", "customeraddresses"),
-    TableConfig("customerprofessions", "gromo_warehouse", "customerprofessions"),
+    TableConfig("customeraddresses", "gromo_warehouse", "customeraddresses", sync_strategy="row_count"),
+    TableConfig("customerprofessions", "gromo_warehouse", "customerprofessions", sync_strategy="row_count"),
     TableConfig("customers", "gromo_warehouse", "customers"),
-    TableConfig("productlogs", "prod", "docdb_gromo_fintech_productlogs"),
+    TableConfig("productlogs", "gromo_warehouse", "productslogs"),
     TableConfig("userdeviceinfos", "gromo_warehouse", "userdeviceinfos"),
     TableConfig("user_personas", "gromo_warehouse", "user_personas"),
     TableConfig("zohotickets", "gromo_warehouse", "zohotickets"),
     TableConfig("miscellaneousappflyerlogdatas", "gromo_warehouse", "miscellaneousappflyerlogdatas"),
     TableConfig("miscellaneousbranchlogdatas", "gromo_warehouse", "miscellaneousbranchlogdatas"),
     TableConfig("usercompetitorappslists", "gromo_warehouse", "usercompetitorappslist"),
-    TableConfig("customerprofiles", "gromo_warehouse", "customerprofiles"),
+    TableConfig("customerprofiles", "gromo_warehouse", "customerprofiles", sync_strategy="row_count"),
     TableConfig("userproductqualities", "gromo_warehouse", "userproductqualities"),
     TableConfig("brelogsv2", "gromo_warehouse", "brelogsv2"),
-    TableConfig("customer-management-system.customerprofiles", "prod", "docdb_customer_management_system_customerprofiles"),
-    TableConfig("leadinfo", "prod", "docdb_gromo_fintech_leadinfo"),
-    TableConfig("leadpayoutinfo", "prod", "docdb_gromo_fintech_leadpayoutinfo"),
+    TableConfig(
+        "customer-management-system.customerprofiles",
+        "gromo_warehouse",
+        "customer_management_system_customerprofiles",
+        sync_strategy="row_count",
+    ),
+    TableConfig("leadinfo", "gromo_warehouse", "lead_info"),
+    TableConfig("leadpayoutinfo", "gromo_warehouse", "lead_payout_info"),
     TableConfig("users", "gromo_warehouse", "gromo_fintech_users"),
     TableConfig("agencyusers", "gromo_warehouse", "agencyusers"),
     TableConfig("products", "gromo_warehouse", "products"),
@@ -110,6 +116,8 @@ def created_at_expression(column_name: str) -> str:
                 THEN TIMESTAMP '1970-01-01 00:00:00'
                     + (CAST({text_value} AS BIGINT) / 1000)
                     * INTERVAL '1 second'
+            WHEN {text_value} ~ '^-?[0-9]+$'
+                THEN NULL
             ELSE {column}::timestamp
         END
     """
@@ -131,18 +139,28 @@ def check_one_table(cursor: Any, conn: Any, config: TableConfig) -> dict[str, An
     relation = f"{quote_ident(config.schema)}.{quote_ident(config.table)}"
     column = quote_ident(config.created_column)
     created_at = created_at_expression(config.created_column)
-    sql = f"""
-        SELECT
-            COUNT(*) AS row_count,
-            COUNT({column}) AS non_null_created_at_count,
-            MAX({created_at}) AS latest_sync_date
-        FROM {relation}
-    """
+    if config.sync_strategy == "row_count":
+        sql = f"""
+            SELECT
+                COUNT(*) AS row_count,
+                COUNT({column}) AS non_null_created_at_count,
+                NULL::timestamp AS latest_sync_date
+            FROM {relation}
+        """
+    else:
+        sql = f"""
+            SELECT
+                COUNT(*) AS row_count,
+                COUNT({column}) AS non_null_created_at_count,
+                MAX({created_at}) AS latest_sync_date
+            FROM {relation}
+        """
 
     result = {
         "table_name": config.display_name,
         "physical_table": f"{config.schema}.{config.table}",
         "created_at_column": config.created_column,
+        "sync_strategy": config.sync_strategy,
         "row_count": None,
         "non_null_created_at_count": None,
         "latest_sync_date": None,
@@ -224,7 +242,12 @@ def append_history(current_df: pd.DataFrame, run_date: dt.date) -> None:
             )
 
 
-def status_from_history(history_df: pd.DataFrame, table_name: str, target_date: dt.date) -> str:
+def status_from_history(
+    history_df: pd.DataFrame,
+    table_name: str,
+    target_date: dt.date,
+    sync_strategy: str,
+) -> str:
     if history_df.empty:
         return "Not synced"
 
@@ -232,7 +255,17 @@ def status_from_history(history_df: pd.DataFrame, table_name: str, target_date: 
     if table_history.empty:
         return "Not synced"
 
-    latest_dates = pd.to_datetime(table_history["latest_sync_date"], errors="coerce")
+    if sync_strategy == "row_count":
+        run_dates = pd.to_datetime(table_history["run_date"], errors="coerce").dt.date
+        row_counts = pd.to_numeric(table_history["row_count"], errors="coerce").fillna(0)
+        errors = table_history["error"].fillna("").astype(str)
+        expected_snapshot_date = target_date + dt.timedelta(days=1)
+        usable_history = table_history[
+            (run_dates >= expected_snapshot_date) & (row_counts > 0) & (errors == "")
+        ].copy()
+        return "Synced" if not usable_history.empty else "Not synced"
+
+    latest_dates = pd.to_datetime(table_history["latest_sync_date"], errors="coerce", format="mixed")
     if latest_dates.dropna().empty:
         return "Not synced"
 
@@ -248,9 +281,13 @@ def build_report_dataframe(current_df: pd.DataFrame, run_date: dt.date) -> pd.Da
     for _, row in current_df.iterrows():
         report_row = {
             "Table": row["table_name"],
-            target_dates[0].isoformat(): status_from_history(history_df, row["table_name"], target_dates[0]),
-            target_dates[1].isoformat(): status_from_history(history_df, row["table_name"], target_dates[1]),
-            "Latest createdat": pd.to_datetime(row["latest_sync_date"], errors="coerce"),
+            target_dates[0].isoformat(): status_from_history(
+                history_df, row["table_name"], target_dates[0], row["sync_strategy"]
+            ),
+            target_dates[1].isoformat(): status_from_history(
+                history_df, row["table_name"], target_dates[1], row["sync_strategy"]
+            ),
+            "Latest createdat": pd.to_datetime(row["latest_sync_date"], errors="coerce", format="mixed"),
             "Rows": row["row_count"],
             "Note": "Query error" if row.get("error") else ("Zero rows" if row.get("row_count") == 0 else ""),
         }
